@@ -5,6 +5,7 @@ import win "core:sys/windows"
 foreign import winhttp "system:winhttp.lib"
 foreign import user32 "system:user32.lib"
 foreign import shell32 "system:shell32.lib"
+foreign import oleaut32 "system:oleaut32.lib"
 
 URL_COMPONENTS :: struct {
 	dwStructSize: win.DWORD,
@@ -117,6 +118,86 @@ foreign user32 {
 foreign shell32 {
 	SHBrowseForFolderW :: proc(bi: ^BROWSEINFOW) -> rawptr ---
 	SHGetPathFromIDListW :: proc(pidl: rawptr, path: [^]u16) -> win.BOOL ---
+}
+
+@(default_calling_convention = "system")
+foreign oleaut32 {
+	SysFreeString :: proc(str: win.LPWSTR) ---
+}
+
+ISetupInstance :: struct #raw_union {
+	#subtype iunknown: win.IUnknown,
+	using vtable: ^ISetupInstance_VTable,
+}
+
+ISetupInstance_VTable :: struct {
+	using iunknown_vtable: win.IUnknown_VTable,
+	GetInstanceId: proc "system" (this: ^ISetupInstance, id: ^win.LPWSTR) -> win.HRESULT,
+	GetInstallDate: proc "system" (this: ^ISetupInstance, date: ^win.FILETIME) -> win.HRESULT,
+	GetInstallationName: proc "system" (this: ^ISetupInstance, name: ^win.LPWSTR) -> win.HRESULT,
+	GetInstallationPath: proc "system" (this: ^ISetupInstance, path: ^win.LPWSTR) -> win.HRESULT,
+	GetInstallationVersion: proc "system" (
+		this: ^ISetupInstance,
+		version: ^win.LPWSTR,
+	) -> win.HRESULT,
+	GetDisplayName: proc "system" (
+		this: ^ISetupInstance,
+		lcid: win.LCID,
+		name: ^win.LPWSTR,
+	) -> win.HRESULT,
+	GetDescription: proc "system" (
+		this: ^ISetupInstance,
+		lcid: win.LCID,
+		description: ^win.LPWSTR,
+	) -> win.HRESULT,
+	ResolvePath: proc "system" (
+		this: ^ISetupInstance,
+		relative_path: win.LPCWSTR,
+		absolute_path: ^win.LPWSTR,
+	) -> win.HRESULT,
+}
+
+IEnumSetupInstances :: struct #raw_union {
+	#subtype iunknown: win.IUnknown,
+	using vtable: ^IEnumSetupInstances_VTable,
+}
+
+IEnumSetupInstances_VTable :: struct {
+	using iunknown_vtable: win.IUnknown_VTable,
+	Next: proc "system" (
+		this: ^IEnumSetupInstances,
+		count: win.ULONG,
+		instances: ^^ISetupInstance,
+		fetched: ^win.ULONG,
+	) -> win.HRESULT,
+	Skip: proc "system" (this: ^IEnumSetupInstances, count: win.ULONG) -> win.HRESULT,
+	Reset: proc "system" (this: ^IEnumSetupInstances) -> win.HRESULT,
+	Clone: proc "system" (
+		this: ^IEnumSetupInstances,
+		clone: ^^IEnumSetupInstances,
+	) -> win.HRESULT,
+}
+
+ISetupConfiguration :: struct #raw_union {
+	#subtype iunknown: win.IUnknown,
+	using vtable: ^ISetupConfiguration_VTable,
+}
+
+ISetupConfiguration_VTable :: struct {
+	using iunknown_vtable: win.IUnknown_VTable,
+	EnumInstances: proc "system" (
+		this: ^ISetupConfiguration,
+		instances: ^^IEnumSetupInstances,
+	) -> win.HRESULT,
+	GetInstanceForCurrentProcess: proc "system" (
+		this: ^ISetupConfiguration,
+		instance: ^^ISetupInstance,
+	) -> win.HRESULT,
+	GetInstanceForPath: proc "system" (
+		this: ^ISetupConfiguration,
+		path: win.LPCWSTR,
+		instance: ^^ISetupInstance,
+	) -> win.HRESULT,
 }
 
 WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY :: 4

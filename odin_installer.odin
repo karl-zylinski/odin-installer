@@ -87,6 +87,8 @@ g_nightly: bool
 g_release_index: int
 g_add_path: bool
 g_already_in_path: bool
+g_msvc_found: bool
+g_sdk_note_y: i32
 g_install_sdk: bool
 g_license_accepted: bool
 g_installed_name: string
@@ -104,6 +106,29 @@ g_finished_cancelled: bool
 main :: proc() {
 	g_ctx = context
 	g_page_allocator = runtime.arena_allocator(&g_page_arena)
+	system_dir_buf: [win.MAX_PATH]u16
+	win.GetSystemDirectoryW(&system_dir_buf[0], win.MAX_PATH)
+	system_dir_w := cstring16(&system_dir_buf[0])
+	system_dir, _ := win.wstring_to_utf8(system_dir_w, -1, context.temp_allocator)
+	shell32_path := fmt.tprintf("%s\\shell32.dll", system_dir)
+
+	common_controls_context := win.ACTCTXW {
+		Size = size_of(win.ACTCTXW),
+		Flags = win.ACTCTX_FLAG_RESOURCE_NAME_VALID,
+		Source = win.utf8_to_wstring(shell32_path, context.temp_allocator),
+		ResourceName = cstring16(win.MAKEINTRESOURCEW(124)),
+	}
+
+	common_controls_handle := win.CreateActCtxW(&common_controls_context)
+	common_controls_cookie: win.ULONG_PTR
+	win.ActivateActCtx(common_controls_handle, &common_controls_cookie)
+	user32 := win.GetModuleHandleW("user32.dll")
+	set_dpi_awareness_address := win.GetProcAddress(user32, "SetProcessDpiAwarenessContext")
+	set_dpi_awareness := cast(type_of(win.SetProcessDpiAwarenessContext))set_dpi_awareness_address
+
+	if set_dpi_awareness != nil {
+		set_dpi_awareness(win.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+	}
 
 	icc := win.INITCOMMONCONTROLSEX {
 		dwSize = size_of(win.INITCOMMONCONTROLSEX),
@@ -132,7 +157,13 @@ main :: proc() {
 	g_client_height = g_is_updater ? UPDATER_CLIENT_HEIGHT : CLIENT_HEIGHT
 	g_already_in_path = g_is_updater && is_dir_in_path(installer_dir)
 	g_add_path = !g_already_in_path
-	g_install_sdk = !g_is_updater
+	g_install_sdk = false
+
+	if !g_is_updater {
+		g_msvc_found = system_has_visual_studio_and_windows_sdk()
+		g_install_sdk = !g_msvc_found
+	}
+
 	g_install_dir = g_is_updater ? installer_dir : "C:\\odin"
 
 	if g_is_updater {
@@ -240,8 +271,6 @@ main :: proc() {
 		g_instance,
 		nil,
 	)
-
-	user32 := win.GetModuleHandleW("user32.dll")
 
 	// To support older Windows versions we fetch this one at run time.
 	get_dpi_for_window_address := win.GetProcAddress(user32, "GetDpiForWindow")
@@ -745,10 +774,8 @@ paint_spinner :: proc(hdc: win.HDC, spinner_y: i32) {
 refresh_installer_page :: proc(page: win.HWND) -> bool {
 	release_list := win.GetDlgItem(page, i32(Installer_Page_Control.Release_List))
 	license_check := win.GetDlgItem(page, i32(Installer_Page_Control.License_Check))
-	license_link := win.GetDlgItem(page, i32(Installer_Page_Control.License_Link))
 	win.EnableWindow(release_list, win.BOOL(!g_nightly))
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
-	win.EnableWindow(license_link, win.BOOL(g_install_sdk))
 	can_continue := true
 
 	if len(g_releases) == 0 {
@@ -888,7 +915,7 @@ show_installer_page :: proc() {
 		g_page,
 		i32(Installer_Page_Control.SDK_Check),
 		"BUTTON",
-		"Install the Windows &SDK and MSVC runtime libraries",
+		"Download the Windows &SDK and MSVC runtime libraries",
 		check_style,
 		32,
 		y,
@@ -896,18 +923,7 @@ show_installer_page :: proc() {
 		20,
 	)
 
-	create_control(
-		g_page,
-		0,
-		"STATIC",
-		"This is needed for linking. The files are downloaded into the \"windows_libs\" folder within the install folder.",
-		0,
-		50,
-		y + 22,
-		438,
-		36,
-	)
-
+	g_sdk_note_y = y + 22
 	y += 60
 	license_check := create_control(
 		g_page,
@@ -1070,6 +1086,30 @@ installer_page_proc :: proc "system" (
 			paint_spinner(hdc, INSTALLER_SPINNER_Y)
 		}
 
+		dpi := i32(g_dpi)
+		win.SetBkMode(hdc, .TRANSPARENT)
+		win.SetTextColor(hdc, win.GetSysColor(win.COLOR_BTNTEXT))
+		note_left := 50 * dpi / 96
+		note_right := 488 * dpi / 96
+		note_top := g_sdk_note_y * dpi / 96
+		note_line_height := 16 * dpi / 96
+
+		if g_msvc_found {
+			note := []string {
+				"Not needed: Already present on system. If installed anyways, then the Odin compiler will have its own set of these libraries.",
+			}
+
+			paint_text_parts(hdc, note, note_left, note_right, note_top, note_line_height)
+		} else {
+			note := []string {
+				"This is needed for linking. These additional files will be in the ",
+				"windows_libs",
+				" folder within the install folder. No additional environment variables are created.",
+			}
+
+			paint_text_parts(hdc, note, note_left, note_right, note_top, note_line_height)
+		}
+
 		win.EndPaint(hwnd, &ps)
 		return 0
 
@@ -1117,10 +1157,8 @@ installer_page_proc :: proc "system" (
 refresh_updater_page :: proc(page: win.HWND) -> bool {
 	release_list := win.GetDlgItem(page, i32(Updater_Page_Control.Release_List))
 	license_check := win.GetDlgItem(page, i32(Updater_Page_Control.License_Check))
-	license_link := win.GetDlgItem(page, i32(Updater_Page_Control.License_Link))
 	win.EnableWindow(release_list, win.BOOL(!g_nightly))
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
-	win.EnableWindow(license_link, win.BOOL(g_install_sdk))
 	can_continue := true
 
 	if len(g_releases) == 0 {
@@ -1847,6 +1885,64 @@ updater_finished_page_proc :: proc "system" (
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+paint_text_parts :: proc(
+	hdc: win.HDC,
+	parts: []string,
+	left: i32,
+	right: i32,
+	top: i32,
+	line_height: i32,
+) -> i32 {
+	x := left
+	line_y := top
+
+	for part, i in parts {
+		part_font := i % 2 == 1 ? g_bold_font : g_font
+		win.SelectObject(hdc, win.HGDIOBJ(part_font))
+		part_buf: [win.MAX_PATH + 64]u16
+		part_w := win.utf8_to_utf16(part_buf[:], part)
+		start := 0
+
+		for start < len(part_w) {
+			end := start
+
+			for end < len(part_w) {
+				c := part_w[end]
+				end += 1
+
+				if c == ' ' || c == '\\' {
+					break
+				}
+			}
+
+			piece := cstring16(&part_w[start])
+			piece_size: win.SIZE
+			win.GetTextExtentPoint32W(hdc, piece, i32(end - start), &piece_size)
+
+			if x + piece_size.cx > right && x > left {
+				x = left
+				line_y += line_height
+
+				if part_w[start] == ' ' {
+					start += 1
+					continue
+				}
+			}
+
+			for x + piece_size.cx > right && end - start > 1 {
+				end -= 1
+				win.GetTextExtentPoint32W(hdc, piece, i32(end - start), &piece_size)
+			}
+
+			win.TextOutW(hdc, x, line_y, piece, i32(end - start))
+			x += piece_size.cx
+			start = end
+		}
+	}
+
+	return line_y
+}
+
 paint_finished_items :: proc(hdc: win.HDC) {
 	paint_item :: proc(hdc: win.HDC, y: ^i32, parts: []string) {
 		dpi := i32(g_dpi)
@@ -1858,54 +1954,7 @@ paint_finished_items :: proc(hdc: win.HDC) {
 		win.SetTextColor(hdc, win.GetSysColor(win.COLOR_BTNTEXT))
 		left := 58 * dpi / 96
 		right := 488 * dpi / 96
-		line_height := 18 * dpi / 96
-		x := left
-		line_y := y^ + 2 * dpi / 96
-
-		for part, i in parts {
-			part_font := i % 2 == 1 ? g_bold_font : g_font
-			win.SelectObject(hdc, win.HGDIOBJ(part_font))
-			part_buf: [win.MAX_PATH + 64]u16
-			part_w := win.utf8_to_utf16(part_buf[:], part)
-			start := 0
-
-			for start < len(part_w) {
-				end := start
-
-				for end < len(part_w) {
-					c := part_w[end]
-					end += 1
-
-					if c == ' ' || c == '\\' {
-						break
-					}
-				}
-
-				piece := cstring16(&part_w[start])
-				piece_size: win.SIZE
-				win.GetTextExtentPoint32W(hdc, piece, i32(end - start), &piece_size)
-
-				if x + piece_size.cx > right && x > left {
-					x = left
-					line_y += line_height
-
-					if part_w[start] == ' ' {
-						start += 1
-						continue
-					}
-				}
-
-				for x + piece_size.cx > right && end - start > 1 {
-					end -= 1
-					win.GetTextExtentPoint32W(hdc, piece, i32(end - start), &piece_size)
-				}
-
-				win.TextOutW(hdc, x, line_y, piece, i32(end - start))
-				x += piece_size.cx
-				start = end
-			}
-		}
-
+		line_y := paint_text_parts(hdc, parts, left, right, y^ + 2 * dpi / 96, 18 * dpi / 96)
 		y^ = line_y + 26 * dpi / 96
 	}
 
@@ -1924,6 +1973,8 @@ paint_finished_items :: proc(hdc: win.HDC) {
 	}
 }
 
+// Parts of this is based on Mārtiņš Možeiko's portable-msvc.py:
+// https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977
 install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 	context = runtime.default_context()
 
@@ -3146,6 +3197,246 @@ unzip :: proc(data: []u8, dest: string, prefix: string) -> bool {
 
 	set_progress(1000)
 	return true
+}
+
+// Based on Jon Blow's "microsoft_craziness.h"
+system_has_visual_studio_and_windows_sdk :: proc() -> bool {
+	has_version_dir :: proc(dir_name: string) -> bool {
+		wildcard_name := strings.concatenate({dir_name, "*"}, context.temp_allocator)
+		find_data: win.WIN32_FIND_DATAW
+		wildcard_w := win.utf8_to_wstring(wildcard_name, context.temp_allocator)
+		handle := win.FindFirstFileW(wildcard_w, &find_data)
+
+		if handle == win.INVALID_HANDLE_VALUE {
+			return false
+		}
+
+		found := false
+
+		for {
+			is_dir := find_data.dwFileAttributes & win.FILE_ATTRIBUTE_DIRECTORY != 0
+			file_name_w := cstring16(&find_data.cFileName[0])
+			file_name, _ := win.wstring_to_utf8(file_name_w, -1, context.temp_allocator)
+			parts := strings.split(file_name, ".", context.temp_allocator)
+			is_version := is_dir && len(parts) == 4
+
+			for part in parts {
+				_, number_ok := strconv.parse_int(part)
+
+				if !number_ok {
+					is_version = false
+				}
+			}
+
+			if is_version {
+				found = true
+			}
+
+			if !win.FindNextFileW(handle, &find_data) {
+				break
+			}
+		}
+
+		win.FindClose(handle)
+		return found
+	}
+
+	read_registry_string :: proc(key: win.HKEY, value_name: win.LPCWSTR) -> string {
+		value_size: win.DWORD
+		value_flags: win.DWORD = win.RRF_RT_REG_SZ
+		size_result := win.RegGetValueW(key, nil, value_name, value_flags, nil, nil, &value_size)
+
+		if size_result != 0 || value_size == 0 {
+			return ""
+		}
+
+		value_w := make([]u16, value_size / 2 + 1, context.temp_allocator)
+
+		value_result := win.RegGetValueW(
+			key,
+			nil,
+			value_name,
+			value_flags,
+			nil,
+			&value_w[0],
+			&value_size,
+		)
+
+		if value_result != 0 {
+			return ""
+		}
+
+		value, _ := win.wstring_to_utf8(cstring16(&value_w[0]), -1, context.temp_allocator)
+		return value
+	}
+
+	file_exists :: proc(path: string) -> bool {
+		attributes := win.GetFileAttributesW(win.utf8_to_wstring(path, context.temp_allocator))
+		return attributes != win.INVALID_FILE_ATTRIBUTES
+	}
+
+	arena: runtime.Arena
+	defer runtime.arena_destroy(&arena)
+	context.allocator = runtime.arena_allocator(&arena) 
+	context.temp_allocator = context.allocator
+	kits_key: win.HKEY
+
+	kits_open_result := win.RegOpenKeyExW(
+		win.HKEY_LOCAL_MACHINE,
+		"SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots",
+		0,
+		win.KEY_QUERY_VALUE | win.KEY_WOW64_32KEY,
+		&kits_key,
+	)
+
+	if kits_open_result != 0 {
+		return false
+	}
+
+	windows10_root := read_registry_string(kits_key, "KitsRoot10")
+	win.RegCloseKey(kits_key)
+
+	if windows10_root == "" {
+		return false
+	}
+
+	windows10_lib := strings.concatenate({windows10_root, "Lib\\"}, context.temp_allocator)
+	windows10_bin := strings.concatenate({windows10_root, "bin\\"}, context.temp_allocator)
+	has_lib := has_version_dir(windows10_lib)
+	has_bin := has_version_dir(windows10_bin)
+
+	if !has_lib || !has_bin {
+		return false
+	}
+
+	setup_configuration_iid := win.IID {
+		0x42843719,
+		0xDB4C,
+		0x46C2,
+		{0x8E, 0x7C, 0x64, 0xF1, 0x81, 0x6E, 0xFD, 0x5B},
+	}
+
+	setup_configuration_clsid := win.CLSID {
+		0x177F0C4A,
+		0x1CD3,
+		0x4DE7,
+		{0xA3, 0x2C, 0x71, 0xDB, 0xBB, 0x9F, 0xA3, 0x6D},
+	}
+
+	config: ^win_ex.ISetupConfiguration
+
+	create_result := win.CoCreateInstance(
+		&setup_configuration_clsid,
+		nil,
+		win.CLSCTX_INPROC_SERVER,
+		&setup_configuration_iid,
+		cast(^rawptr)&config,
+	)
+
+	if create_result == 0 {
+		defer config->Release()
+		instances: ^win_ex.IEnumSetupInstances
+		enum_result := config->EnumInstances(&instances)
+
+		if enum_result != 0 || instances == nil {
+			return false
+		}
+
+		defer instances->Release()
+
+		for {
+			found: win.ULONG
+			instance: ^win_ex.ISetupInstance
+			next_result := instances->Next(1, &instance, &found)
+
+			if next_result != 0 {
+				break
+			}
+
+			defer instance->Release()
+			install_path_w: win.LPWSTR
+			path_result := instance->GetInstallationPath(&install_path_w)
+
+			if path_result != 0 {
+				continue
+			}
+
+			install_path_c := cstring16(install_path_w)
+			install_path, _ := win.wstring_to_utf8(install_path_c, -1, context.temp_allocator)
+			win_ex.SysFreeString(install_path_w)
+			TOOLS_FILE_SUFFIX :: "\\VC\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt"
+			tools_parts := []string{install_path, TOOLS_FILE_SUFFIX}
+			tools_filename := strings.concatenate(tools_parts, context.temp_allocator)
+
+			tools_handle := win.CreateFileW(
+				win.utf8_to_wstring(tools_filename, context.temp_allocator),
+				win.GENERIC_READ,
+				win.FILE_SHARE_READ,
+				nil,
+				win.OPEN_EXISTING,
+				win.FILE_ATTRIBUTE_NORMAL,
+				nil,
+			)
+
+			if tools_handle == win.INVALID_HANDLE_VALUE {
+				continue
+			}
+
+			tools_buf: [256]u8
+			tools_read: win.DWORD
+			tools_buf_len := win.DWORD(len(tools_buf))
+			win.ReadFile(tools_handle, &tools_buf[0], tools_buf_len, &tools_read, nil)
+			win.CloseHandle(tools_handle)
+			tools_version := strings.trim_space(string(tools_buf[:tools_read]))
+
+			vcruntime_parts := []string {
+				install_path,
+				"\\VC\\Tools\\MSVC\\",
+				tools_version,
+				"\\lib\\x64\\vcruntime.lib",
+			}
+
+			vcruntime_file := strings.concatenate(vcruntime_parts, context.temp_allocator)
+
+			if file_exists(vcruntime_file) {
+				return true
+			}
+		}
+	}
+
+	vs7_key: win.HKEY
+
+	vs7_open_result := win.RegOpenKeyExW(
+		win.HKEY_LOCAL_MACHINE,
+		"SOFTWARE\\Microsoft\\VisualStudio\\SxS\\VS7",
+		0,
+		win.KEY_QUERY_VALUE | win.KEY_WOW64_32KEY,
+		&vs7_key,
+	)
+
+	if vs7_open_result != 0 {
+		return false
+	}
+
+	defer win.RegCloseKey(vs7_key)
+	versions := [?]win.LPCWSTR{"14.0", "13.0", "12.0", "11.0", "10.0", "9.0"}
+
+	for version in versions {
+		base_path := read_registry_string(vs7_key, version)
+
+		if base_path == "" {
+			continue
+		}
+
+		vcruntime_parts := []string{base_path, "VC\\Lib\\amd64\\vcruntime.lib"}
+		vcruntime_file := strings.concatenate(vcruntime_parts, context.temp_allocator)
+
+		if file_exists(vcruntime_file) {
+			return true
+		}
+	}
+
+	return false
 }
 
 is_dir_in_path :: proc(dir: string) -> bool {
