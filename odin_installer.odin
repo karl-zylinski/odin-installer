@@ -1103,7 +1103,7 @@ installer_page_proc :: proc "system" (
 		} else {
 			note := []string {
 				"This is needed for linking. These additional files will be in the ",
-				"windows_libs",
+				"bin\\msvc",
 				" folder within the install folder. No additional environment variables are created.",
 			}
 
@@ -1964,7 +1964,7 @@ paint_finished_items :: proc(hdc: win.HDC) {
 
 	if g_install_sdk {
 		sdk_dir_buf: [win.MAX_PATH * 4 + 64]u8
-		sdk_dir := fmt.bprintf(sdk_dir_buf[:], "%s\\windows_libs", g_install_dir)
+		sdk_dir := fmt.bprintf(sdk_dir_buf[:], "%s\\bin\\msvc", g_install_dir)
 		paint_item(hdc, &y, {"Windows libraries installed to ", sdk_dir})
 	}
 
@@ -2032,7 +2032,7 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 			manifest_lines := strings.split_lines(manifest_text, context.temp_allocator)
 
 			for line in manifest_lines {
-				if strings.has_prefix(line, "odin\t") || strings.has_prefix(line, "sdk\t") {
+				if strings.has_prefix(line, "odin\t") || strings.has_prefix(line, "msvc\t") {
 					append(&old_manifest_lines, line)
 				}
 			}
@@ -2127,7 +2127,7 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 			break install
 		}
 
-		staging_sdk := fmt.tprintf("%s\\windows_libs", temp_dir)
+		staging_sdk := fmt.tprintf("%s\\msvc", temp_dir)
 
 		if g_install_sdk {
 			set_step(.MSVC)
@@ -2564,50 +2564,34 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 				break install
 			}
 
-			kits := fmt.tprintf("%s\\Windows Kits\\10", extracted_sdk)
-			sdk_lib := fmt.tprintf("%s\\Lib\\%s", kits, sdk_version)
-			sdk_bin := fmt.tprintf("%s\\bin\\%s\\x64", kits, sdk_version)
-
-			vc_tools := fmt.tprintf(
-				"%s\\VC\\Tools\\MSVC\\%s",
-				extracted_sdk,
-				vc_version,
-			)
-
+			vc_tools := fmt.tprintf("VC\\Tools\\MSVC\\%s", vc_version)
 			vc_bin := fmt.tprintf("%s\\bin\\Hostx64\\x64", vc_tools)
+			sdk_lib := fmt.tprintf("Windows Kits\\10\\Lib\\%s", sdk_version)
+			sdk_bin := fmt.tprintf("Windows Kits\\10\\bin\\%s\\x64", sdk_version)
 
-			Flat_Move :: struct {
-				src_dir: string,
-				src_name: string,
-				dst: string,
+			msvc_paths := [?]string {
+				fmt.tprintf("%s\\lib\\x64", vc_tools),
+				fmt.tprintf("%s\\link.exe", vc_bin),
+				fmt.tprintf("%s\\lib.exe", vc_bin),
+				fmt.tprintf("%s\\cvtres.exe", vc_bin),
+				fmt.tprintf("%s\\mspdbsrv.exe", vc_bin),
+				fmt.tprintf("%s\\mspdb140.dll", vc_bin),
+				fmt.tprintf("%s\\mspdbcore.dll", vc_bin),
+				fmt.tprintf("%s\\msobj140.dll", vc_bin),
+				fmt.tprintf("%s\\tbbmalloc.dll", vc_bin),
+				fmt.tprintf("%s\\um\\x64", sdk_lib),
+				fmt.tprintf("%s\\ucrt\\x64", sdk_lib),
+				fmt.tprintf("%s\\rc.exe", sdk_bin),
+				fmt.tprintf("%s\\rcdll.dll", sdk_bin),
+				fmt.tprintf("%s\\ServicingCommon.dll", sdk_bin),
 			}
 
-			flat_moves := [?]Flat_Move {
-				{vc_tools, "lib\\x64", "vc\\x64"},
-				{sdk_lib, "ucrt\\x64", "ucrt\\x64"},
-				{sdk_lib, "um\\x64", "um\\x64"},
-				{sdk_bin, "rc.exe", "bin\\x64\\rc.exe"},
-				{sdk_bin, "rcdll.dll", "bin\\x64\\rcdll.dll"},
-				{sdk_bin, "ServicingCommon.dll", "bin\\x64\\ServicingCommon.dll"},
-				{vc_bin, "link.exe", "bin\\x64\\link.exe"},
-				{vc_bin, "lib.exe", "bin\\x64\\lib.exe"},
-				{vc_bin, "cvtres.exe", "bin\\x64\\cvtres.exe"},
-				{vc_bin, "mspdbsrv.exe", "bin\\x64\\mspdbsrv.exe"},
-				{vc_bin, "mspdb140.dll", "bin\\x64\\mspdb140.dll"},
-				{vc_bin, "mspdbcore.dll", "bin\\x64\\mspdbcore.dll"},
-				{vc_bin, "msobj140.dll", "bin\\x64\\msobj140.dll"},
-				{vc_bin, "tbbmalloc.dll", "bin\\x64\\tbbmalloc.dll"},
-			}
-
-			for flat_dir in ([?]string{"vc", "ucrt", "um", "bin\\x64"}) {
-				flat_dir_path := fmt.tprintf("%s\\%s", staging_sdk, flat_dir)
-				flat_dir_path_w := win.utf8_to_wstring(flat_dir_path, context.temp_allocator)
-				win.SHCreateDirectoryExW(nil, flat_dir_path_w, nil)
-			}
-
-			for flat_move in flat_moves {
-				src := fmt.tprintf("%s\\%s", flat_move.src_dir, flat_move.src_name)
-				dst := fmt.tprintf("%s\\%s", staging_sdk, flat_move.dst)
+			for msvc_path in msvc_paths {
+				src := fmt.tprintf("%s\\%s", extracted_sdk, msvc_path)
+				dst := fmt.tprintf("%s\\%s", staging_sdk, msvc_path)
+				dst_parent := dst[:strings.last_index_byte(dst, '\\')]
+				dst_parent_w := win.utf8_to_wstring(dst_parent, context.temp_allocator)
+				win.SHCreateDirectoryExW(nil, dst_parent_w, nil)
 				src_w := win.utf8_to_wstring(src, context.temp_allocator)
 				dst_w := win.utf8_to_wstring(dst, context.temp_allocator)
 
@@ -2621,8 +2605,8 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 				}
 			}
 
-			delete_tree(fmt.tprintf("%s\\vc\\x64\\store", staging_sdk))
-			delete_tree(fmt.tprintf("%s\\vc\\x64\\uwp", staging_sdk))
+			delete_tree(fmt.tprintf("%s\\%s\\lib\\x64\\store", staging_sdk, vc_tools))
+			delete_tree(fmt.tprintf("%s\\%s\\lib\\x64\\uwp", staging_sdk, vc_tools))
 		}
 
 		set_step(.Finish)
@@ -2648,9 +2632,9 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 				set_progress(line_index * 1000 / len(old_manifest_lines))
 			}
 
-			is_sdk := strings.has_prefix(line, "sdk\t")
+			is_msvc := strings.has_prefix(line, "msvc\t")
 
-			if is_sdk && !g_install_sdk {
+			if is_msvc && !g_install_sdk {
 				append(&new_manifest_lines, line)
 				continue
 			}
@@ -2707,11 +2691,11 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 		}
 
 		moves := make([dynamic]Move, context.temp_allocator)
-		sdk_dir := fmt.tprintf("%s\\windows_libs", g_install_dir)
+		sdk_dir := fmt.tprintf("%s\\bin\\msvc", g_install_dir)
 
 		move_roots := [2]Move_Root{
 			{staging_odin, g_install_dir, "odin\t"},
-			{g_install_sdk ? staging_sdk : "", sdk_dir, "sdk\twindows_libs\\"},
+			{g_install_sdk ? staging_sdk : "", sdk_dir, "msvc\tbin\\msvc\\"},
 		}
 
 		for root in move_roots {
