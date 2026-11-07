@@ -1,4 +1,7 @@
-Windows installer for the Odin Programming Language that also downloads required MSVC/WinSDK files. Upon successful install, it copies itself into the Odin folder and can then be used as an Odin updater.
+Windows installer for the Odin Programming Language.
+- Pick which release to use, or if you want the latest nightly build
+- Can download required MSVC + WinSDK files, making any kind of Visual Studio install redundant
+- Copies itself into the installation folder, when run from there it acts as an updater.
 
 ## [Download latest release](https://github.com/karl-zylinski/odin-installer/releases/latest/download/odin-installer.exe)
 
