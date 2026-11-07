@@ -36,6 +36,18 @@ BROWSEINFOW :: struct {
 	iImage: i32,
 }
 
+TOOLINFOW :: struct {
+	cbSize: win.UINT,
+	uFlags: win.UINT,
+	hwnd: win.HWND,
+	uId: win.UINT_PTR,
+	rect: win.RECT,
+	hinst: win.HINSTANCE,
+	lpszText: win.wstring,
+	lParam: win.LPARAM,
+	lpReserved: rawptr,
+}
+
 @(default_calling_convention = "system")
 foreign winhttp {
 	WinHttpOpen :: proc(
@@ -212,3 +224,4 @@ SMTO_ABORTIFHUNG :: 0x0002
 LOGPIXELSY :: 90
 NM_CLICK :: ~u32(1)
 NM_RETURN :: ~u32(3)
+TTF_SUBCLASS :: 0x0010

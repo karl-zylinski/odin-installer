@@ -28,6 +28,7 @@ WM_APP_DISABLE_CANCEL :: win.WM_APP + 7
 WM_APP_NEXT :: win.WM_APP + 8
 WM_APP_CANCEL :: win.WM_APP + 9
 WM_APP_REBUILD :: win.WM_APP + 10
+WM_APP_RELEASE_LIST_FAILED :: win.WM_APP + 11
 CANCEL_NONE :: 0
 CANCEL_REQUESTED :: 1
 CANCEL_COMMITTED :: 2
@@ -93,6 +94,8 @@ g_install_sdk: bool
 g_license_accepted: bool
 g_installed_name: string
 g_releases: []Release
+g_releases_fetched: bool
+g_release_tooltip: win.HWND
 g_spinner_frame: int
 g_current_version: string
 g_client_height: i32
@@ -428,20 +431,25 @@ wnd_proc :: proc "system" (
 		win.EnableWindow(g_frame.cancel, false)
 		return 0
 
-	case WM_APP_RELEASE_LIST_FETCHED:
-		if wparam == 0 {
-			win.MessageBoxW(
-				hwnd,
-				"The release information for Odin could not be downloaded from GitHub.\n\nCheck your internet connection and run the installer again.",
-				g_is_updater ? "Odin Updater" : "Odin Installer",
-				win.MB_OK | win.MB_ICONERROR,
-			)
+	case WM_APP_RELEASE_LIST_FAILED:
+		win.MessageBoxW(
+			hwnd,
+			"The release information for Odin could not be downloaded from GitHub.\n\nCheck your internet connection and run the installer again.",
+			g_is_updater ? "Odin Updater" : "Odin Installer",
+			win.MB_OK | win.MB_ICONERROR,
+		)
 
-			win.DestroyWindow(hwnd)
-			return 0
+		win.DestroyWindow(hwnd)
+		return 0
+
+	case WM_APP_RELEASE_LIST_FETCHED:
+		g_releases = (cast([^]Release)uintptr(lparam))[:wparam]
+		g_releases_fetched = true
+
+		if len(g_releases) == 0 {
+			g_nightly = true
 		}
 
-		g_releases = (cast([^]Release)uintptr(lparam))[:wparam]
 		win.SendMessageW(g_page, WM_APP_RELEASE_LIST_FETCHED, 0, 0)
 		return 0
 
@@ -563,17 +571,24 @@ releases_worker :: proc "system" (param: rawptr) -> win.DWORD {
 	index, index_ok := download(ODIN_RELEASES_URL, "release list")
 
 	if !index_ok {
-		win.PostMessageW(g_hwnd, WM_APP_RELEASE_LIST_FETCHED, 0, 0)
+		win.PostMessageW(g_hwnd, WM_APP_RELEASE_LIST_FAILED, 0, 0)
 		free_all(context.temp_allocator)
 		return 0
 	}
 
+	MIN_PUBLISHED_AT :: "2026-11-07"
 	root, _ := json.parse(index, allocator = context.allocator)
 	releases_json, _ := root.(json.Array)
 	release_count := 0
 
 	for release in releases_json {
 		release_obj, _ := release.(json.Object)
+		published_at, _ := release_obj["published_at"].(json.String)
+
+		if published_at < MIN_PUBLISHED_AT {
+			continue
+		}
+
 		assets, _ := release_obj["assets"].(json.Array)
 		has_windows_zip := false
 
@@ -601,6 +616,12 @@ releases_worker :: proc "system" (param: rawptr) -> win.DWORD {
 		}
 
 		release_obj, _ := release.(json.Object)
+		published_at, _ := release_obj["published_at"].(json.String)
+
+		if published_at < MIN_PUBLISHED_AT {
+			continue
+		}
+
 		tag, _ := release_obj["tag_name"].(json.String)
 		assets, _ := release_obj["assets"].(json.Array)
 		picked: Release
@@ -691,6 +712,50 @@ create_control :: proc(
 	return hwnd
 }
 
+add_release_tooltip :: proc(page: win.HWND, release: win.HWND, release_list: win.HWND) {
+	TOOLTIP_TEXT :: "Picking a release is disabled until the 2026-12 release comes out."
+
+	g_release_tooltip = win.CreateWindowExW(
+		win.WS_EX_TOPMOST,
+		win.TOOLTIPS_CLASS,
+		nil,
+		win.WS_POPUP | win.TTS_ALWAYSTIP,
+		win.CW_USEDEFAULT,
+		win.CW_USEDEFAULT,
+		win.CW_USEDEFAULT,
+		win.CW_USEDEFAULT,
+		page,
+		nil,
+		g_instance,
+		nil,
+	)
+
+	max_width := 400 * i32(g_dpi) / 96
+	win.SendMessageW(g_release_tooltip, win.TTM_SETMAXTIPWIDTH, 0, win.LPARAM(max_width))
+	controls := [2]win.HWND{release, release_list}
+
+	for control, i in controls {
+		rect: win.RECT
+		win.GetWindowRect(control, &rect)
+		top_left := win.POINT{rect.left, rect.top}
+		bottom_right := win.POINT{rect.right, rect.bottom}
+		win.ScreenToClient(page, &top_left)
+		win.ScreenToClient(page, &bottom_right)
+		rect = win.RECT{top_left.x, top_left.y, bottom_right.x, bottom_right.y}
+
+		info := win_ex.TOOLINFOW {
+			cbSize = size_of(win_ex.TOOLINFOW),
+			uFlags = win_ex.TTF_SUBCLASS,
+			hwnd = page,
+			uId = win.UINT_PTR(i),
+			rect = rect,
+			lpszText = page_temp_wstring(TOOLTIP_TEXT),
+		}
+
+		win.SendMessageW(g_release_tooltip, win.TTM_ADDTOOLW, 0, transmute(win.LPARAM)&info)
+	}
+}
+
 is_checked :: proc(page: win.HWND, id: i32) -> bool {
 	return win.SendMessageW(win.GetDlgItem(page, id), win.BM_GETCHECK, 0, 0) == win.BST_CHECKED
 }
@@ -705,6 +770,8 @@ page_temp_wstring :: proc(s: string) -> win.wstring {
 
 create_new_page :: proc(new_page: Page) {
 	free_all(g_page_allocator)
+	win.DestroyWindow(g_release_tooltip)
+	g_release_tooltip = nil
 	win.DestroyWindow(g_page)
 	dpi := i32(g_dpi)
 
@@ -772,13 +839,17 @@ paint_spinner :: proc(hdc: win.HDC, spinner_y: i32) {
 }
 
 refresh_installer_page :: proc(page: win.HWND) -> bool {
+	release := win.GetDlgItem(page, i32(Installer_Page_Control.Release))
 	release_list := win.GetDlgItem(page, i32(Installer_Page_Control.Release_List))
 	license_check := win.GetDlgItem(page, i32(Installer_Page_Control.License_Check))
-	win.EnableWindow(release_list, win.BOOL(!g_nightly))
+	has_releases := len(g_releases) > 0
+	release_list_enabled := has_releases && !g_nightly
+	win.EnableWindow(release, win.BOOL(has_releases))
+	win.EnableWindow(release_list, win.BOOL(release_list_enabled))
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
 	can_continue := true
 
-	if len(g_releases) == 0 {
+	if !g_releases_fetched {
 		can_continue = false
 	}
 
@@ -795,7 +866,7 @@ show_installer_page :: proc() {
 	create_control(g_page, 0, "STATIC", "Which version do you want to install?", 0, 32, y, 456, 20)
 	y += 23
 
-	if len(g_releases) > 0 {
+	if g_releases_fetched {
 		radio_style := win.WS_TABSTOP | win.WS_GROUP | win.BS_AUTORADIOBUTTON
 
 		release := create_control(
@@ -849,6 +920,10 @@ show_installer_page :: proc() {
 
 		win.SendMessageW(combo, win.CB_SETCURSEL, uintptr(g_release_index), 0)
 		win.SendMessageW(g_nightly ? nightly : release, win.BM_SETCHECK, win.BST_CHECKED, 0)
+
+		if len(g_releases) == 0 {
+			add_release_tooltip(g_page, release, combo)
+		}
 	} else {
 		create_control(
 			g_page,
@@ -1082,7 +1157,7 @@ installer_page_proc :: proc "system" (
 		ps: win.PAINTSTRUCT
 		hdc := win.BeginPaint(hwnd, &ps)
 
-		if len(g_releases) == 0 {
+		if !g_releases_fetched {
 			paint_spinner(hdc, INSTALLER_SPINNER_Y)
 		}
 
@@ -1102,7 +1177,7 @@ installer_page_proc :: proc "system" (
 			paint_text_parts(hdc, note, note_left, note_right, note_top, note_line_height)
 		} else {
 			note := []string {
-				"This is needed for linking. These additional files will be in the ",
+				"This is needed for linking. These additional files will end up in the ",
 				"bin\\msvc",
 				" folder within the install folder. No additional environment variables are created.",
 			}
@@ -1155,13 +1230,17 @@ installer_page_proc :: proc "system" (
 }
 
 refresh_updater_page :: proc(page: win.HWND) -> bool {
+	release := win.GetDlgItem(page, i32(Updater_Page_Control.Release))
 	release_list := win.GetDlgItem(page, i32(Updater_Page_Control.Release_List))
 	license_check := win.GetDlgItem(page, i32(Updater_Page_Control.License_Check))
-	win.EnableWindow(release_list, win.BOOL(!g_nightly))
+	has_releases := len(g_releases) > 0
+	release_list_enabled := has_releases && !g_nightly
+	win.EnableWindow(release, win.BOOL(has_releases))
+	win.EnableWindow(release_list, win.BOOL(release_list_enabled))
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
 	can_continue := true
 
-	if len(g_releases) == 0 {
+	if !g_releases_fetched {
 		can_continue = false
 	}
 
@@ -1192,7 +1271,7 @@ show_updater_page :: proc() {
 	create_control(g_page, 0, "STATIC", "Which version do you want to switch to?", 0, 32, y, 456, 20)
 	y += 23
 
-	if len(g_releases) > 0 {
+	if g_releases_fetched {
 		radio_style := win.WS_TABSTOP | win.WS_GROUP | win.BS_AUTORADIOBUTTON
 
 		release := create_control(
@@ -1246,6 +1325,10 @@ show_updater_page :: proc() {
 
 		win.SendMessageW(combo, win.CB_SETCURSEL, uintptr(g_release_index), 0)
 		win.SendMessageW(g_nightly ? nightly : release, win.BM_SETCHECK, win.BST_CHECKED, 0)
+
+		if len(g_releases) == 0 {
+			add_release_tooltip(g_page, release, combo)
+		}
 	} else {
 		create_control(
 			g_page,
@@ -1432,7 +1515,7 @@ updater_page_proc :: proc "system" (
 		ps: win.PAINTSTRUCT
 		hdc := win.BeginPaint(hwnd, &ps)
 
-		if len(g_releases) == 0 {
+		if !g_releases_fetched {
 			paint_spinner(hdc, UPDATER_SPINNER_Y)
 		}
 
