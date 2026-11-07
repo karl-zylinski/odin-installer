@@ -1110,7 +1110,7 @@ show_installer_page :: proc() {
 	link_height := text_metrics.tmHeight
 	win.SetWindowPos(license_link, nil, link_x, link_y, link_width, link_height, win.SWP_NOZORDER)
 
-	add_disabled_tooltip(g_page, path_check, "Already in path.")
+	add_disabled_tooltip(g_page, path_check, "Already in PATH.")
 	g_already_in_path = is_dir_in_path(g_install_dir)
 
 	win.SendMessageW(
@@ -1277,6 +1277,31 @@ installer_page_proc :: proc "system" (
 			win.MessageBoxW(
 				g_hwnd,
 				"Please enter a full install path, for example C:\\odin.",
+				"Odin Installer",
+				win.MB_ICONWARNING,
+			)
+
+			return 0
+		}
+
+		if !is_dir_empty(g_install_dir) {
+			updater_path := fmt.tprintf("%s\\%s", g_install_dir, UPDATER_EXE)
+			updater_path_w := win.utf8_to_wstring(updater_path, context.temp_allocator)
+			has_updater := win.GetFileAttributesW(updater_path_w) != win.INVALID_FILE_ATTRIBUTES
+			message := fmt.tprintf("%s must be an empty folder.", g_install_dir)
+
+			if has_updater {
+				message = fmt.tprintf(
+					"%s already contains an Odin installation. To update it, run %s\\%s.",
+					g_install_dir,
+					g_install_dir,
+					UPDATER_EXE,
+				)
+			}
+
+			win.MessageBoxW(
+				g_hwnd,
+				win.utf8_to_wstring(message, context.temp_allocator),
 				"Odin Installer",
 				win.MB_ICONWARNING,
 			)
@@ -3589,6 +3614,35 @@ system_has_visual_studio_and_windows_sdk :: proc() -> bool {
 	}
 
 	return false
+}
+
+is_dir_empty :: proc(dir: string) -> bool {
+	pattern := fmt.tprintf("%s\\*", dir)
+	find_data: win.WIN32_FIND_DATAW
+	find := win.FindFirstFileW(win.utf8_to_wstring(pattern, context.temp_allocator), &find_data)
+
+	if find == win.INVALID_HANDLE_VALUE {
+		return true
+	}
+
+	empty := true
+
+	for {
+		file_name := cstring16(&find_data.cFileName[0])
+		name, _ := win.wstring_to_utf8(file_name, -1, context.temp_allocator)
+
+		if name != "." && name != ".." {
+			empty = false
+			break
+		}
+
+		if !win.FindNextFileW(find, &find_data) {
+			break
+		}
+	}
+
+	win.FindClose(find)
+	return empty
 }
 
 is_dir_in_path :: proc(dir: string) -> bool {
