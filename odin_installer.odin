@@ -44,6 +44,7 @@ PROGRESS_ID :: 10
 LICENSE_URL :: "https://go.microsoft.com/fwlink/?LinkId=2327714"
 MANIFEST_FILE :: "odin-install-manifest"
 UPDATER_EXE :: "odin-updater.exe"
+RELEASE_TOOLTIP :: "Picking a release is disabled until the 2026-12 release comes out."
 
 CLIENT_WIDTH :: 520
 HEADER_HEIGHT :: 44
@@ -88,6 +89,7 @@ g_nightly: bool
 g_release_index: int
 g_add_path: bool
 g_already_in_path: bool
+g_path_added: bool
 g_msvc_found: bool
 g_sdk_note_y: i32
 g_install_sdk: bool
@@ -95,7 +97,7 @@ g_license_accepted: bool
 g_installed_name: string
 g_releases: []Release
 g_releases_fetched: bool
-g_release_tooltip: win.HWND
+g_tooltip: win.HWND
 g_spinner_frame: int
 g_current_version: string
 g_client_height: i32
@@ -568,9 +570,9 @@ releases_worker :: proc "system" (param: rawptr) -> win.DWORD {
 	context = runtime.default_context()
 
 	ODIN_RELEASES_URL :: "https://api.github.com/repos/odin-lang/Odin/releases?per_page=20"
-	index, index_ok := download(ODIN_RELEASES_URL, "release list")
+	index, index_result := download(ODIN_RELEASES_URL, "release list")
 
-	if !index_ok {
+	if index_result != .Ok {
 		win.PostMessageW(g_hwnd, WM_APP_RELEASE_LIST_FAILED, 0, 0)
 		free_all(context.temp_allocator)
 		return 0
@@ -712,48 +714,44 @@ create_control :: proc(
 	return hwnd
 }
 
-add_release_tooltip :: proc(page: win.HWND, release: win.HWND, release_list: win.HWND) {
-	TOOLTIP_TEXT :: "Picking a release is disabled until the 2026-12 release comes out."
+add_disabled_tooltip :: proc(page: win.HWND, control: win.HWND, text: string) {
+	if g_tooltip == nil {
+		g_tooltip = win.CreateWindowExW(
+			win.WS_EX_TOPMOST,
+			win.TOOLTIPS_CLASS,
+			nil,
+			win.WS_POPUP | win.TTS_ALWAYSTIP,
+			win.CW_USEDEFAULT,
+			win.CW_USEDEFAULT,
+			win.CW_USEDEFAULT,
+			win.CW_USEDEFAULT,
+			page,
+			nil,
+			g_instance,
+			nil,
+		)
 
-	g_release_tooltip = win.CreateWindowExW(
-		win.WS_EX_TOPMOST,
-		win.TOOLTIPS_CLASS,
-		nil,
-		win.WS_POPUP | win.TTS_ALWAYSTIP,
-		win.CW_USEDEFAULT,
-		win.CW_USEDEFAULT,
-		win.CW_USEDEFAULT,
-		win.CW_USEDEFAULT,
-		page,
-		nil,
-		g_instance,
-		nil,
-	)
-
-	max_width := 400 * i32(g_dpi) / 96
-	win.SendMessageW(g_release_tooltip, win.TTM_SETMAXTIPWIDTH, 0, win.LPARAM(max_width))
-	controls := [2]win.HWND{release, release_list}
-
-	for control, i in controls {
-		rect: win.RECT
-		win.GetWindowRect(control, &rect)
-		top_left := win.POINT{rect.left, rect.top}
-		bottom_right := win.POINT{rect.right, rect.bottom}
-		win.ScreenToClient(page, &top_left)
-		win.ScreenToClient(page, &bottom_right)
-		rect = win.RECT{top_left.x, top_left.y, bottom_right.x, bottom_right.y}
-
-		info := win_ex.TOOLINFOW {
-			cbSize = size_of(win_ex.TOOLINFOW),
-			uFlags = win_ex.TTF_SUBCLASS,
-			hwnd = page,
-			uId = win.UINT_PTR(i),
-			rect = rect,
-			lpszText = page_temp_wstring(TOOLTIP_TEXT),
-		}
-
-		win.SendMessageW(g_release_tooltip, win.TTM_ADDTOOLW, 0, transmute(win.LPARAM)&info)
+		max_width := 400 * i32(g_dpi) / 96
+		win.SendMessageW(g_tooltip, win.TTM_SETMAXTIPWIDTH, 0, win.LPARAM(max_width))
 	}
+
+	rect: win.RECT
+	win.GetWindowRect(control, &rect)
+	top_left := win.POINT{rect.left, rect.top}
+	bottom_right := win.POINT{rect.right, rect.bottom}
+	win.ScreenToClient(page, &top_left)
+	win.ScreenToClient(page, &bottom_right)
+
+	info := win_ex.TOOLINFOW {
+		cbSize = size_of(win_ex.TOOLINFOW),
+		uFlags = win_ex.TTF_SUBCLASS,
+		hwnd = page,
+		uId = win.UINT_PTR(uintptr(control)),
+		rect = win.RECT{top_left.x, top_left.y, bottom_right.x, bottom_right.y},
+		lpszText = page_temp_wstring(text),
+	}
+
+	win.SendMessageW(g_tooltip, win.TTM_ADDTOOLW, 0, transmute(win.LPARAM)&info)
 }
 
 is_checked :: proc(page: win.HWND, id: i32) -> bool {
@@ -770,8 +768,8 @@ page_temp_wstring :: proc(s: string) -> win.wstring {
 
 create_new_page :: proc(new_page: Page) {
 	free_all(g_page_allocator)
-	win.DestroyWindow(g_release_tooltip)
-	g_release_tooltip = nil
+	win.DestroyWindow(g_tooltip)
+	g_tooltip = nil
 	win.DestroyWindow(g_page)
 	dpi := i32(g_dpi)
 
@@ -841,11 +839,16 @@ paint_spinner :: proc(hdc: win.HDC, spinner_y: i32) {
 refresh_installer_page :: proc(page: win.HWND) -> bool {
 	release := win.GetDlgItem(page, i32(Installer_Page_Control.Release))
 	release_list := win.GetDlgItem(page, i32(Installer_Page_Control.Release_List))
+	path_check := win.GetDlgItem(page, i32(Installer_Page_Control.Path_Check))
 	license_check := win.GetDlgItem(page, i32(Installer_Page_Control.License_Check))
 	has_releases := len(g_releases) > 0
 	release_list_enabled := has_releases && !g_nightly
+	add_path := g_add_path && !g_already_in_path
+	path_state: win.WPARAM = add_path ? win.BST_CHECKED : win.BST_UNCHECKED
 	win.EnableWindow(release, win.BOOL(has_releases))
 	win.EnableWindow(release_list, win.BOOL(release_list_enabled))
+	win.EnableWindow(path_check, win.BOOL(!g_already_in_path))
+	win.SendMessageW(path_check, win.BM_SETCHECK, path_state, 0)
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
 	can_continue := true
 
@@ -922,7 +925,8 @@ show_installer_page :: proc() {
 		win.SendMessageW(g_nightly ? nightly : release, win.BM_SETCHECK, win.BST_CHECKED, 0)
 
 		if len(g_releases) == 0 {
-			add_release_tooltip(g_page, release, combo)
+			add_disabled_tooltip(g_page, release, RELEASE_TOOLTIP)
+			add_disabled_tooltip(g_page, combo, RELEASE_TOOLTIP)
 		}
 	} else {
 		create_control(
@@ -1042,12 +1046,8 @@ show_installer_page :: proc() {
 	link_height := text_metrics.tmHeight
 	win.SetWindowPos(license_link, nil, link_x, link_y, link_width, link_height, win.SWP_NOZORDER)
 
-	win.SendMessageW(
-		path_check,
-		win.BM_SETCHECK,
-		g_add_path ? win.BST_CHECKED : win.BST_UNCHECKED,
-		0,
-	)
+	add_disabled_tooltip(g_page, path_check, "Already in path.")
+	g_already_in_path = is_dir_in_path(g_install_dir)
 
 	win.SendMessageW(
 		sdk_check,
@@ -1101,8 +1101,13 @@ installer_page_proc :: proc "system" (
 			}
 		case .Release, .Nightly, .Path_Check, .SDK_Check, .License_Check:
 			if code == win.BN_CLICKED {
+				path_check := win.GetDlgItem(hwnd, i32(Installer_Page_Control.Path_Check))
+
+				if win.IsWindowEnabled(path_check) {
+					g_add_path = is_checked(hwnd, i32(Installer_Page_Control.Path_Check))
+				}
+
 				g_nightly = is_checked(hwnd, i32(Installer_Page_Control.Nightly))
-				g_add_path = is_checked(hwnd, i32(Installer_Page_Control.Path_Check))
 				g_install_sdk = is_checked(hwnd, i32(Installer_Page_Control.SDK_Check))
 				g_license_accepted = is_checked(hwnd, i32(Installer_Page_Control.License_Check))
 				can_continue := refresh_installer_page(hwnd)
@@ -1115,6 +1120,8 @@ installer_page_proc :: proc "system" (
 				win_ex.GetDlgItemTextW(hwnd, dir_edit_id, &dir_buf[0], win.MAX_PATH)
 				dir := win.wstring_to_utf8(g_install_dir_buf[:], cstring16(&dir_buf[0]))
 				g_install_dir = strings.trim_right(strings.trim_space(dir), "\\/")
+				g_already_in_path = is_dir_in_path(g_install_dir)
+				refresh_installer_page(hwnd)
 			}
 		case .Browse:
 			if code == win.BN_CLICKED {
@@ -1327,7 +1334,8 @@ show_updater_page :: proc() {
 		win.SendMessageW(g_nightly ? nightly : release, win.BM_SETCHECK, win.BST_CHECKED, 0)
 
 		if len(g_releases) == 0 {
-			add_release_tooltip(g_page, release, combo)
+			add_disabled_tooltip(g_page, release, RELEASE_TOOLTIP)
+			add_disabled_tooltip(g_page, combo, RELEASE_TOOLTIP)
 		}
 	} else {
 		create_control(
@@ -1553,6 +1561,7 @@ updater_page_proc :: proc "system" (
 }
 
 start_install_worker :: proc() {
+	g_path_added = false
 	g_current_step = .Odin
 	g_progress_status = ""
 	g_progress_pos = 0
@@ -2051,7 +2060,7 @@ paint_finished_items :: proc(hdc: win.HDC) {
 		paint_item(hdc, &y, {"Windows libraries installed to ", sdk_dir})
 	}
 
-	if g_add_path {
+	if g_path_added {
 		paint_item(hdc, &y, {"", g_install_dir, " added to user's PATH"})
 	}
 }
@@ -2126,12 +2135,13 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 		odin_version: string
 		odin_hash: string
 		odin_hash_algorithm := hash.Algorithm.SHA256
+		odin_hash_header := ""
 
 		if g_nightly {
 			ODIN_NIGHTLY_URL :: "https://f001.backblazeb2.com/file/odin-binaries/nightly.json"
-			index, index_ok := download(ODIN_NIGHTLY_URL, "nightly build list")
+			index, index_result := download(ODIN_NIGHTLY_URL, "nightly build list")
 
-			if !index_ok {
+			if index_result != .Ok {
 				set_error("Could not download the list of nightly builds.")
 				break install
 			}
@@ -2167,6 +2177,12 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 						odin_version = fmt.tprintf("nightly %s", date)
 						odin_hash = sha1
 						odin_hash_algorithm = .Insecure_SHA1
+						odin_hash_header = ""
+
+						if sha1 == "none" {
+							odin_hash = ""
+							odin_hash_header = "x-bz-info-large_file_sha1"
+						}
 					}
 				}
 			}
@@ -2184,9 +2200,20 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 
 		g_installed_name = strings.clone(odin_version, context.allocator)
 
-		odin_zip, odin_zip_ok := download(odin_url, odin_name, odin_hash, odin_hash_algorithm)
+		odin_zip, odin_zip_result := download(
+			odin_url,
+			odin_name,
+			odin_hash,
+			odin_hash_algorithm,
+			odin_hash_header,
+		)
 
-		if !odin_zip_ok {
+		if odin_zip_result == .Hash_Mismatch {
+			set_error("%s was downloaded, but its checksum does not match.", odin_name)
+			break install
+		}
+
+		if odin_zip_result != .Ok {
 			set_error("Could not download %s.", odin_name)
 			break install
 		}
@@ -2223,9 +2250,9 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 			}
 
 			VS_CHANNEL_URL :: "https://aka.ms/vs/stable/channel"
-			channel, channel_ok := download(VS_CHANNEL_URL, "Visual Studio channel manifest")
+			channel, channel_result := download(VS_CHANNEL_URL, "Visual Studio channel manifest")
 
-			if !channel_ok {
+			if channel_result != .Ok {
 				set_error("Could not download the Visual Studio channel manifest.")
 				break install
 			}
@@ -2254,9 +2281,9 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 				break install
 			}
 
-			manifest, manifest_ok := download(manifest_url, "Visual Studio package manifest")
+			manifest, manifest_result := download(manifest_url, "Visual Studio package manifest")
 
-			if !manifest_ok {
+			if manifest_result != .Ok {
 				set_error("Could not download the Visual Studio package manifest.")
 				break install
 			}
@@ -2433,9 +2460,18 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 					vc_payload_obj, _ := vc_payload.(json.Object)
 					vsix_url, _ := vc_payload_obj["url"].(json.String)
 					vsix_sha256, _ := vc_payload_obj["sha256"].(json.String)
-					vsix, vsix_ok := download(vsix_url, vc_package_ids[i], vsix_sha256)
+					vsix, vsix_result := download(vsix_url, vc_package_ids[i], vsix_sha256)
 
-					if !vsix_ok {
+					if vsix_result == .Hash_Mismatch {
+						set_error(
+							"%s was downloaded, but its checksum does not match.",
+							vc_package_ids[i],
+						)
+
+						break install
+					}
+
+					if vsix_result != .Ok {
 						set_error("Could not download %s.", vc_package_ids[i])
 						break install
 					}
@@ -2476,9 +2512,14 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 
 				msi_url, _ := msi_payload["url"].(json.String)
 				msi_sha256, _ := msi_payload["sha256"].(json.String)
-				msi, msi_ok := download(msi_url, msi_name, msi_sha256)
+				msi, msi_result := download(msi_url, msi_name, msi_sha256)
 
-				if !msi_ok {
+				if msi_result == .Hash_Mismatch {
+					set_error("%s was downloaded, but its checksum does not match.", msi_name)
+					break install
+				}
+
+				if msi_result != .Ok {
 					set_error("Could not download %s.", msi_name)
 					break install
 				}
@@ -2513,9 +2554,14 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 					cab_label := fmt.tprintf("%s (%s)", msi_name, cab_name)
 					cab_url, _ := cab_payload["url"].(json.String)
 					cab_sha256, _ := cab_payload["sha256"].(json.String)
-					cab, cab_ok := download(cab_url, cab_label, cab_sha256)
+					cab, cab_result := download(cab_url, cab_label, cab_sha256)
 
-					if !cab_ok {
+					if cab_result == .Hash_Mismatch {
+						set_error("%s was downloaded, but its checksum does not match.", cab_name)
+						break install
+					}
+
+					if cab_result != .Ok {
 						set_error("Could not download %s.", cab_name)
 						break install
 					}
@@ -2952,6 +2998,8 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 					break install
 				}
 
+				g_path_added = true
+
 				win.SendMessageTimeoutW(
 					win.HWND_BROADCAST,
 					win.WM_SETTINGCHANGE,
@@ -3003,9 +3051,10 @@ download :: proc(
 	label: string,
 	expected_hash := "",
 	hash_algorithm := hash.Algorithm.SHA256,
+	hash_header := "",
 ) -> (
 	[]u8,
-	bool,
+	Download_Result,
 ) {
 	set_status(fmt.tprintf("Downloading %s...", label))
 	set_marquee(false)
@@ -3020,7 +3069,7 @@ download :: proc(
 	}
 
 	if !win_ex.WinHttpCrackUrl(wurl, 0, 0, &uc) {
-		return nil, false
+		return nil, .Failed
 	}
 
 	host: [512]u16
@@ -3029,7 +3078,7 @@ download :: proc(
 	conn := win_ex.WinHttpConnect(g_session, cstring16(&host[0]), uc.nPort, 0)
 
 	if conn == nil {
-		return nil, false
+		return nil, .Failed
 	}
 
 	defer win_ex.WinHttpCloseHandle(conn)
@@ -3045,7 +3094,7 @@ download :: proc(
 	)
 
 	if req == nil {
-		return nil, false
+		return nil, .Failed
 	}
 
 	defer win_ex.WinHttpCloseHandle(req)
@@ -3053,13 +3102,13 @@ download :: proc(
 	sent := win_ex.WinHttpSendRequest(req, nil, 0, nil, 0, 0, 0)
 
 	if !sent {
-		return nil, false
+		return nil, .Failed
 	}
 
 	received := win_ex.WinHttpReceiveResponse(req, nil)
 
 	if !received {
-		return nil, false
+		return nil, .Failed
 	}
 
 	status: win.DWORD
@@ -3075,7 +3124,28 @@ download :: proc(
 	)
 
 	if status != 200 {
-		return nil, false
+		return nil, .Failed
+	}
+
+	hash_to_verify := expected_hash
+
+	if hash_header != "" {
+		header_buf: [256]u16
+		header_size := win.DWORD(size_of(header_buf))
+
+		header_ok := win_ex.WinHttpQueryHeaders(
+			req,
+			win_ex.WINHTTP_QUERY_CUSTOM,
+			win.utf8_to_wstring(hash_header, context.temp_allocator),
+			&header_buf[0],
+			&header_size,
+			nil,
+		)
+
+		if header_ok {
+			header_value := header_buf[:header_size / size_of(u16)]
+			hash_to_verify, _ = win.utf16_to_utf8(header_value, context.temp_allocator)
+		}
 	}
 
 	total: win.DWORD
@@ -3097,14 +3167,14 @@ download :: proc(
 	for {
 		if intrinsics.atomic_load(&g_cancel_state) == CANCEL_REQUESTED {
 			delete(data)
-			return nil, false
+			return nil, .Failed
 		}
 
 		read: win.DWORD
 
 		if !win_ex.WinHttpReadData(req, &buf[0], len(buf), &read) {
 			delete(data)
-			return nil, false
+			return nil, .Failed
 		}
 
 		if read == 0 {
@@ -3134,18 +3204,18 @@ download :: proc(
 		}
 	}
 
-	if expected_hash != "" {
+	if hash_to_verify != "" {
 		set_status(fmt.tprintf("Verifying %s...", label))
 		digest := hash.hash_bytes(hash_algorithm, data[:], context.temp_allocator)
 		digest_hex := hex.encode(digest, context.temp_allocator)
 
-		if !strings.equal_fold(string(digest_hex), expected_hash) {
+		if !strings.equal_fold(string(digest_hex), hash_to_verify) {
 			delete(data)
-			return nil, false
+			return nil, .Hash_Mismatch
 		}
 	}
 
-	return data[:], true
+	return data[:], .Ok
 }
 
 write_file :: proc(path: string, data: []u8) -> bool {
@@ -3633,6 +3703,12 @@ Install_Step :: enum {
 Arch :: enum {
 	AMD64,
 	ARM64,
+}
+
+Download_Result :: enum {
+	Ok,
+	Failed,
+	Hash_Mismatch,
 }
 
 Release :: struct {
