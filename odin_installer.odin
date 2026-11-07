@@ -97,6 +97,7 @@ g_license_accepted: bool
 g_installed_name: string
 g_releases: []Release
 g_releases_fetched: bool
+g_latest_nightly: Nightly
 g_tooltip: win.HWND
 g_spinner_frame: int
 g_current_version: string
@@ -158,10 +159,9 @@ main :: proc() {
 	g_is_updater = manifest_attributes != win.INVALID_FILE_ATTRIBUTES
 
 	CLIENT_HEIGHT :: 358
-	UPDATER_CLIENT_HEIGHT :: 334
+	UPDATER_CLIENT_HEIGHT :: 310
 	g_client_height = g_is_updater ? UPDATER_CLIENT_HEIGHT : CLIENT_HEIGHT
-	g_already_in_path = g_is_updater && is_dir_in_path(installer_dir)
-	g_add_path = !g_already_in_path
+	g_add_path = !g_is_updater
 	g_install_sdk = false
 
 	if !g_is_updater {
@@ -650,6 +650,56 @@ releases_worker :: proc "system" (param: rawptr) -> win.DWORD {
 		}
 	}
 
+	ODIN_NIGHTLY_URL :: "https://f001.backblazeb2.com/file/odin-binaries/nightly.json"
+	nightly_index, nightly_result := download(ODIN_NIGHTLY_URL, "nightly build list")
+
+	if nightly_result != .Ok {
+		win.PostMessageW(g_hwnd, WM_APP_RELEASE_LIST_FAILED, 0, 0)
+		free_all(context.temp_allocator)
+		return 0
+	}
+
+	nightly_root, _ := json.parse(nightly_index, allocator = context.allocator)
+	nightly_obj, _ := nightly_root.(json.Object)
+	files, _ := nightly_obj["files"].(json.Object)
+	latest_nightly_date := ""
+	latest_nightly_rank := -1
+
+	for date, entries in files {
+		entries_arr, _ := entries.(json.Array)
+
+		for entry in entries_arr {
+			entry_obj, _ := entry.(json.Object)
+			name, _ := entry_obj["name"].(json.String)
+			url, _ := entry_obj["url"].(json.String)
+			sha1, _ := entry_obj["sha1"].(json.String)
+
+			is_windows_zip := (
+				strings.contains(name, "windows") &&
+				strings.has_suffix(name, ".zip")
+			)
+
+			rank := arch_rank(name)
+			is_better_same_date := date == latest_nightly_date && rank > latest_nightly_rank
+
+			if is_windows_zip && (date > latest_nightly_date || is_better_same_date) {
+				latest_nightly_date = date
+				latest_nightly_rank = rank
+				version := fmt.aprintf("nightly %s", date, allocator = context.allocator)
+				g_latest_nightly.version = version
+				g_latest_nightly.name = name
+				g_latest_nightly.url = url
+				g_latest_nightly.sha1 = sha1
+				g_latest_nightly.sha1_header = ""
+
+				if sha1 == "none" {
+					g_latest_nightly.sha1 = ""
+					g_latest_nightly.sha1_header = "x-bz-info-large_file_sha1"
+				}
+			}
+		}
+	}
+
 	releases_ptr := win.LPARAM(uintptr(raw_data(releases)))
 	win.PostMessageW(g_hwnd, WM_APP_RELEASE_LIST_FETCHED, uintptr(len(releases)), releases_ptr)
 	free_all(context.temp_allocator)
@@ -839,6 +889,7 @@ paint_spinner :: proc(hdc: win.HDC, spinner_y: i32) {
 refresh_installer_page :: proc(page: win.HWND) -> bool {
 	release := win.GetDlgItem(page, i32(Installer_Page_Control.Release))
 	release_list := win.GetDlgItem(page, i32(Installer_Page_Control.Release_List))
+	nightly_text := win.GetDlgItem(page, i32(Installer_Page_Control.Nightly_Text))
 	path_check := win.GetDlgItem(page, i32(Installer_Page_Control.Path_Check))
 	license_check := win.GetDlgItem(page, i32(Installer_Page_Control.License_Check))
 	has_releases := len(g_releases) > 0
@@ -847,6 +898,7 @@ refresh_installer_page :: proc(page: win.HWND) -> bool {
 	path_state: win.WPARAM = add_path ? win.BST_CHECKED : win.BST_UNCHECKED
 	win.EnableWindow(release, win.BOOL(has_releases))
 	win.EnableWindow(release_list, win.BOOL(release_list_enabled))
+	win.EnableWindow(nightly_text, win.BOOL(g_nightly))
 	win.EnableWindow(path_check, win.BOOL(!g_already_in_path))
 	win.SendMessageW(path_check, win.BM_SETCHECK, path_state, 0)
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
@@ -880,7 +932,7 @@ show_installer_page :: proc() {
 			radio_style,
 			44,
 			y,
-			90,
+			135,
 			20,
 		)
 
@@ -888,11 +940,11 @@ show_installer_page :: proc() {
 			g_page,
 			i32(Installer_Page_Control.Nightly),
 			"BUTTON",
-			"Latest ni&ghtly build",
+			"Latest ni&ghtly build:",
 			win.BS_AUTORADIOBUTTON,
 			44,
 			y + 25,
-			440,
+			135,
 			20,
 		)
 
@@ -904,10 +956,22 @@ show_installer_page :: proc() {
 			"COMBOBOX",
 			"",
 			combo_style,
-			138,
+			183,
 			y - 1,
 			220,
 			240,
+		)
+
+		create_control(
+			g_page,
+			i32(Installer_Page_Control.Nightly_Text),
+			"STATIC",
+			g_latest_nightly.version,
+			win.SS_CENTERIMAGE,
+			183,
+			y + 25,
+			300,
+			20,
 		)
 
 		for r, i in g_releases {
@@ -1239,11 +1303,13 @@ installer_page_proc :: proc "system" (
 refresh_updater_page :: proc(page: win.HWND) -> bool {
 	release := win.GetDlgItem(page, i32(Updater_Page_Control.Release))
 	release_list := win.GetDlgItem(page, i32(Updater_Page_Control.Release_List))
+	nightly_text := win.GetDlgItem(page, i32(Updater_Page_Control.Nightly_Text))
 	license_check := win.GetDlgItem(page, i32(Updater_Page_Control.License_Check))
 	has_releases := len(g_releases) > 0
 	release_list_enabled := has_releases && !g_nightly
 	win.EnableWindow(release, win.BOOL(has_releases))
 	win.EnableWindow(release_list, win.BOOL(release_list_enabled))
+	win.EnableWindow(nightly_text, win.BOOL(g_nightly))
 	win.EnableWindow(license_check, win.BOOL(g_install_sdk))
 	can_continue := true
 
@@ -1289,7 +1355,7 @@ show_updater_page :: proc() {
 			radio_style,
 			44,
 			y,
-			90,
+			135,
 			20,
 		)
 
@@ -1297,11 +1363,11 @@ show_updater_page :: proc() {
 			g_page,
 			i32(Updater_Page_Control.Nightly),
 			"BUTTON",
-			"Latest ni&ghtly build",
+			"Latest ni&ghtly build:",
 			win.BS_AUTORADIOBUTTON,
 			44,
 			y + 25,
-			440,
+			135,
 			20,
 		)
 
@@ -1313,10 +1379,22 @@ show_updater_page :: proc() {
 			"COMBOBOX",
 			"",
 			combo_style,
-			138,
+			183,
 			y - 1,
 			220,
 			240,
+		)
+
+		create_control(
+			g_page,
+			i32(Updater_Page_Control.Nightly_Text),
+			"STATIC",
+			g_latest_nightly.version,
+			win.SS_CENTERIMAGE,
+			183,
+			y + 25,
+			300,
+			20,
 		)
 
 		for r, i in g_releases {
@@ -1355,26 +1433,6 @@ show_updater_page :: proc() {
 
 	y += 57
 	check_style := win.WS_TABSTOP | win.BS_AUTOCHECKBOX
-
-	if !g_already_in_path {
-		path_text := page_tprintf("Add %s to user's &PATH", g_install_dir)
-
-		path_check := create_control(
-			g_page,
-			i32(Updater_Page_Control.Path_Check),
-			"BUTTON",
-			path_text,
-			check_style,
-			32,
-			y,
-			456,
-			20,
-		)
-
-		path_state: win.WPARAM = g_add_path ? win.BST_CHECKED : win.BST_UNCHECKED
-		win.SendMessageW(path_check, win.BM_SETCHECK, path_state, 0)
-		y += 24
-	}
 
 	sdk_check := create_control(
 		g_page,
@@ -1497,10 +1555,9 @@ updater_page_proc :: proc "system" (
 				can_continue := refresh_updater_page(hwnd)
 				win.EnableWindow(g_frame.next, win.BOOL(can_continue))
 			}
-		case .Release, .Nightly, .Path_Check, .SDK_Check, .License_Check:
+		case .Release, .Nightly, .SDK_Check, .License_Check:
 			if code == win.BN_CLICKED {
 				g_nightly = is_checked(hwnd, i32(Updater_Page_Control.Nightly))
-				g_add_path = is_checked(hwnd, i32(Updater_Page_Control.Path_Check))
 				g_install_sdk = is_checked(hwnd, i32(Updater_Page_Control.SDK_Check))
 				g_license_accepted = is_checked(hwnd, i32(Updater_Page_Control.License_Check))
 				can_continue := refresh_updater_page(hwnd)
@@ -2138,54 +2195,12 @@ install_worker :: proc "system" (param: rawptr) -> win.DWORD {
 		odin_hash_header := ""
 
 		if g_nightly {
-			ODIN_NIGHTLY_URL :: "https://f001.backblazeb2.com/file/odin-binaries/nightly.json"
-			index, index_result := download(ODIN_NIGHTLY_URL, "nightly build list")
-
-			if index_result != .Ok {
-				set_error("Could not download the list of nightly builds.")
-				break install
-			}
-
-			root, _ := json.parse(index, allocator = context.temp_allocator)
-			root_obj, _ := root.(json.Object)
-			files, _ := root_obj["files"].(json.Object)
-			latest_date := ""
-			latest_rank := -1
-
-			for date, entries in files {
-				entries_arr, _ := entries.(json.Array)
-
-				for entry in entries_arr {
-					entry_obj, _ := entry.(json.Object)
-					name, _ := entry_obj["name"].(json.String)
-					url, _ := entry_obj["url"].(json.String)
-					sha1, _ := entry_obj["sha1"].(json.String)
-
-					is_windows_zip := (
-						strings.contains(name, "windows") &&
-						strings.has_suffix(name, ".zip")
-					)
-
-					rank := arch_rank(name)
-					is_better_same_date := date == latest_date && rank > latest_rank
-
-					if is_windows_zip && (date > latest_date || is_better_same_date) {
-						latest_date = date
-						latest_rank = rank
-						odin_url = url
-						odin_name = name
-						odin_version = fmt.tprintf("nightly %s", date)
-						odin_hash = sha1
-						odin_hash_algorithm = .Insecure_SHA1
-						odin_hash_header = ""
-
-						if sha1 == "none" {
-							odin_hash = ""
-							odin_hash_header = "x-bz-info-large_file_sha1"
-						}
-					}
-				}
-			}
+			odin_url = g_latest_nightly.url
+			odin_name = g_latest_nightly.name
+			odin_version = g_latest_nightly.version
+			odin_hash = g_latest_nightly.sha1
+			odin_hash_algorithm = .Insecure_SHA1
+			odin_hash_header = g_latest_nightly.sha1_header
 		} else {
 			odin_url = g_releases[g_release_index].url
 			odin_name = g_releases[g_release_index].name
@@ -3705,6 +3720,14 @@ Arch :: enum {
 	ARM64,
 }
 
+Nightly :: struct {
+	version: string,
+	name: string,
+	url: string,
+	sha1: string,
+	sha1_header: string,
+}
+
 Download_Result :: enum {
 	Ok,
 	Failed,
@@ -3728,6 +3751,7 @@ Installer_Page_Control :: enum i32 {
 	Release = 10,
 	Nightly,
 	Release_List,
+	Nightly_Text,
 	Dir_Edit,
 	Browse,
 	Path_Check,
@@ -3740,7 +3764,7 @@ Updater_Page_Control :: enum i32 {
 	Release = 10,
 	Nightly,
 	Release_List,
-	Path_Check,
+	Nightly_Text,
 	SDK_Check,
 	License_Check,
 	License_Link,
